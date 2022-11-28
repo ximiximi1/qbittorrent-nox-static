@@ -85,20 +85,40 @@ if [[ ! "${what_version_codename}" =~ ^(alpine|buster|bullseye|bionic|focal|jamm
 	exit 1
 fi
 #######################################################################################################################################################
-# This function sets some default values we use but whose values can be overridden by certain flags or exported as variables beforr running the script
+# This function sets some default values we use but whose values can be overridden by certain flags or exported as variables before running the script
 #######################################################################################################################################################
 set_default_values() {
 	DEBIAN_FRONTEND="noninteractive" && TZ="Europe/London" # For docker deploys to not get prompted to set the timezone.
 
 	qbt_build_tool="${qbt_build_tool:-qmake}"
-	qbt_cross_name="${qbt_cross_name:-}"
-	qbt_cross_target="${qbt_cross_target:-${what_id}}"
-	qbt_cmake_debug="${qbt_cmake_debug:-}"
-	qbt_workflow_files="${qbt_workflow_files:-}"                          # github actions workflows - use https://github.com/userdocs/qbt-workflow-files/releases/tag/rolling instead of direct downloads from various source locations. Provides and alternative source and does not spam download hosts when building matrix builds.
-	qbt_workflow_artifacts="${qbt_workflow_artifacts:-}"                  # github actions workflows - use the workflow files saved as artifacts instead of downloading per matrix
-	qbt_patches_url="${qbt_patches_url:-userdocs/qbittorrent-nox-static}" # Provide a git username and repo in this format - username/repo - In this repo the structure needs to be like this /patches/libtorrent/1.2.11/patch and/or /patches/qbittorrent/4.3.1/patch and your patch file will be automatically fetched and loadded for those matching tags.
-	qbt_libtorrent_version="${qbt_libtorrent_version:-2.0}"               # Set this here so it is easy to see and change
-	qbt_libtorrent_master_jamfile="${qbt_libtorrent_master_jamfile:-no}"
+	qbt_cross_name="${qbt_cross_name:-}"                                    # Default to empty to use host native build tools. This way we can build on native arch on support OS and skip crossbuild toolchains
+	qbt_cross_target="${qbt_cross_target:-${what_id}}"                      # Default to host
+	qbt_build_debug="${qbt_build_debug:-no}"                                # ON to create debug build to use with gdb
+	qbt_workflow_files="${qbt_workflow_files:-no}"                          # github actions workflows - use https://github.com/userdocs/qbt-workflow-files/releases/latest instead of direct downloads from various source locations. Provides an alternative source and does not spam download hosts when building matrix builds.
+	qbt_workflow_artifacts="${qbt_workflow_artifacts:-no}"                  # github actions workflows - use the workflow files saved as artifacts instead of downloading from workflow files or host per matrix
+	qbt_patches_url="${qbt_patches_url:-userdocs/qbittorrent-nox-static}"   # Provide a git username and repo in this format - username/repo - In this repo the structure needs to be like this /patches/libtorrent/1.2.11/patch and/or /patches/qbittorrent/4.3.1/patch and your patch file will be automatically fetched and loadded for those matching tags.
+	qbt_libtorrent_version="${qbt_libtorrent_version:-2.0}"                 # Set this here so it is easy to see and change
+	qbt_libtorrent_master_jamfile="${qbt_libtorrent_master_jamfile:-no}"    # Use release Jamfile unless we need a specific fix from the relevant RC branch. Using this can also break builds when non backported changes are present.
+	qbt_optimise_strip="${qbt_optimise_strip:-no}"                          # Strip by default as we need full debug builds to be useful gdb to backtrace
+	qbt_revision_url="${qbt_revision_url:-userdocs/qbittorrent-nox-static}" # The workflow will set this dynamically so that the urls are not hardcoded to a single repo
+	qbt_workflow_type="${qbt_workflow_type:-standard}"                      # The standard workflow is the non legacy version where the script will increments the revision version automatically.
+
+	if [[ "${qbt_build_debug}" = 'yes' ]]; then
+		qbt_optimise_strip='no'
+		qbt_cmake_debug='ON'
+		qbt_libtorrent_debug='debug-symbols=on'
+		qbt_qbittorrent_debug='--enable-debug'
+	else
+		qbt_cmake_debug='OFF'
+	fi
+
+	if [[ "${qbt_optimise_strip}" = 'yes' && "${qbt_build_debug}" = 'no' ]]; then
+		qbt_strip_qmake='strip'
+		qbt_strip_flags='-s'
+	else
+		qbt_strip_qmake='-nostrip'
+		qbt_strip_flags=''
+	fi
 
 	case "${qbt_qt_version}" in
 		5)
@@ -296,6 +316,10 @@ while (("${#}")); do
 			qbt_build_tool="cmake"
 			shift
 			;;
+		-d | --debug)
+			qbt_build_debug='yes'
+			shift
+			;;
 		-i | --icu)
 			qbt_skip_icu='no'
 			[[ "${qbt_skip_icu}" == 'no' ]] && delete=("${delete[@]/icu/}")
@@ -327,6 +351,10 @@ while (("${#}")); do
 			;;
 		-o | --optimize)
 			optimize="-march=native"
+			shift
+			;;
+		-s | --strip)
+			qbt_optimise_strip='yes'
 			shift
 			;;
 		-h-bv | --help-boost-version)
@@ -558,8 +586,13 @@ set_module_urls() {
 	read -ra qt_version_short_array <<< "${qt_version//\./ }"
 	qt_version_short="${qt_version_short_array[0]/v/}.${qt_version_short_array[1]/v/}"
 
-	qt5_version="$(grep -Em1 "v5" <<< "${qt_github_tag_list}" | sed 's/-lts-lgpl//g')"
-	qt6_version="$(grep -Em1 "v6" <<< "${qt_github_tag_list}")"
+	if [[ "${qbt_qt_version}" =~ ^6 ]]; then
+		qt6_version="$(grep -Em1 "v${qbt_qt_version}" <<< "${qt_github_tag_list}" | sed 's/-lts-lgpl//g')"
+		qt5_version="$(grep -Em1 "v5" <<< "${qt_github_tag_list}" | sed 's/-lts-lgpl//g')"
+	else
+		qt6_version="$(grep -Em1 "v6" <<< "${qt_github_tag_list}")"
+		qt5_version="$(grep -Em1 "v${qbt_qt_version}" <<< "${qt_github_tag_list}" | sed 's/-lts-lgpl//g')"
+	fi
 
 	qtbase_github_tag="${qt_version}"
 	qttools_github_tag="${qt_version}"
@@ -698,7 +731,9 @@ _installation_modules() {
 		echo -e " ${cly}  qbt_cross_name=\"${clg}${qbt_cross_name}${cly}\"${cend}"
 		echo -e " ${cly}  qbt_patches_url=\"${clg}${qbt_patches_url}${cly}\"${cend}"
 		echo -e " ${cly}  qbt_workflow_files=\"${clg}${qbt_workflow_files}${cly}\"${cend}"
-		echo -e " ${cly}  qbt_libtorrent_master_jamfile=\"${clg}${qbt_libtorrent_master_jamfile}${cly}\"${cend}${tn}"
+		echo -e " ${cly}  qbt_libtorrent_master_jamfile=\"${clg}${qbt_libtorrent_master_jamfile}${cly}\"${cend}"
+		echo -e " ${cly}  qbt_optimise_strip=\"${clg}${qbt_optimise_strip}${cly}\"${cend}"
+		echo -e " ${cly}  qbt_build_debug=\"${clg}${qbt_build_debug}${cly}\"${cend}${tn}"
 		exit
 	fi
 }
@@ -1125,6 +1160,23 @@ _release_info() {
 		qbittorrent ${qbittorrent_github_tag#release-} libtorrent ${libtorrent_github_tag#v}
 	TITLE_INFO
 
+	if git_git ls-remote --exit-code --tags "https://github.com/${qbt_revision_url}.git" "${qbittorrent_github_tag#v}_${libtorrent_github_tag}" &> /dev/null; then
+		if grep -q '"name": "dependency-version.json"' < <(curl "https://api.github.com/repos/${qbt_revision_url}/releases/tags/${qbittorrent_github_tag#v}_${libtorrent_github_tag}"); then
+			until curl_curl "https://github.com/${qbt_revision_url}/releases/download/${qbittorrent_github_tag#v}_${libtorrent_github_tag}/dependency-version.json" > remote-dependency-version.json; do
+				echo "Waiting for dependency-version.json URL."
+				sleep 2
+			done
+
+			remote_revision_version="$(sed -rn 's|(.*)"revision": "(.*)"|\2|p' < remote-dependency-version.json)"
+
+			if [[ "${remote_revision_version}" =~ ^[0-9]+$ && "${qbt_workflow_type}" == 'standard' ]]; then
+				qbt_revision_version="$((remote_revision_version + 1))"
+			elif [[ "${remote_revision_version}" =~ ^[0-9]+$ && "${qbt_workflow_type}" == 'legacy' ]]; then
+				qbt_revision_version="${remote_revision_version}"
+			fi
+		fi
+	fi
+
 	cat > "${release_info_dir}/dependency-version.json" <<- DEPENDENCY_INFO
 		{
 		    "qbittorrent": "${qbittorrent_github_tag#release-}",
@@ -1132,7 +1184,8 @@ _release_info() {
 		    "qt6": "${qt6_version#v}",
 		    "libtorrent_${qbt_libtorrent_version//\./_}": "${libtorrent_github_tag#v}",
 		    "boost": "${boost_version#v}",
-		    "openssl": "${openssl_version}"
+		    "openssl": "${openssl_version}",
+		    "revision": "${qbt_revision_version:-0}"
 		}
 	DEPENDENCY_INFO
 
@@ -1164,11 +1217,11 @@ _release_info() {
 
 		## Build matrix for libtorrent ${libtorrent_github_tag}
 
-		ℹ️ With Qbittorrent 4.4.0 onwards all cmake builds use Qt6 and all qmake builds use Qt5, until Qt5 is phased out.
+		ℹ️ With Qbittorrent 4.4.0 onwards all cmake builds use Qt6 and all qmake builds use Qt5, as long as Qt5 is supported.
 
 		ℹ️ [Check the build table for more info](https://github.com/userdocs/qbittorrent-nox-static#build-table---dependencies---arch---os---build-tools)
 
-		⚠️ Binary builds are not stripped by default to preserve debugging with gdb.
+		⚠️ Binary builds are stripped - See https://userdocs.github.io/qbittorrent-nox-static/#/debugging
 
 		<!--
 		declare -A current_build_version
@@ -1178,6 +1231,7 @@ _release_info() {
 		current_build_version[libtorrent_${qbt_libtorrent_version//\./_}]="${libtorrent_github_tag#v}"
 		current_build_version[boost]="${boost_version#v}"
 		current_build_version[openssl]="${openssl_version}"
+		current_build_version[revision]="${qbt_revision_version:-0}"
 		-->
 	RELEASE_INFO
 
@@ -1348,11 +1402,6 @@ while (("${#}")); do
 			_multi_arch
 			shift
 			;;
-		-d | --debug)
-			lt_debug="debug-symbols=on"
-			qbt_debug="--enable-debug"
-			shift
-			;;
 		-n | --no-delete)
 			qbt_skip_delete='yes'
 			shift
@@ -1405,11 +1454,6 @@ while (("${#}")); do
 			override_workflow="yes"
 			shift 2
 			;;
-		-s | --strip)
-			qbt_strip_qmake='strip'
-			qbt_strip_flags='-s'
-			shift
-			;;
 		-h | --help)
 			echo
 			echo -e " ${tb}${tu}Here are a list of available options${cend}"
@@ -1458,12 +1502,15 @@ while (("${#}")); do
 			echo
 			echo -e " ${tb}${tu}env help - supported exportable evironment variables${cend}"
 			echo
-			echo -e " ${td}${clm}export qbt_libtorrent_version=\"\"${cend} ${td}-${cend} ${td}${clr}options${cend} ${td}1.2 2.0${cend}"
-			echo -e " ${td}${clm}export qbt_qt_version=\"\"${cend} ${td}---------${cend} ${td}${clr}options${cend} ${td}5,5.15,6,6.2,6.3 and so on${cend}"
-			echo -e " ${td}${clm}export qbt_build_tool=\"\"${cend} ${td}---------${cend} ${td}${clr}options${cend} ${td}qmake cmake${cend}"
-			echo -e " ${td}${clm}export qbt_cross_name=\"\"${cend} ${td}---------${cend} ${td}${clr}options${cend} ${td}aarch64 armv7 armhf${cend}"
-			echo -e " ${td}${clm}export qbt_patches_url=\"\"${cend} ${td}--------${cend} ${td}${clr}options${cend} ${td}userdocs/qbittorrent-nox-static or usee your full/shorthand github repo${cend}"
-			echo -e " ${td}${clm}export qbt_workflow_files=\"\"${cend} ${td}-----${cend} ${td}${clr}options${cend} ${td}yes no - qbt-workflow-files repo - custom tags will override${cend}"
+			echo -e " ${td}${clm}export qbt_libtorrent_version=\"\"${cend} ${td}--------${cend} ${td}${clr}options${cend} ${td}1.2 - 2.0${cend}"
+			echo -e " ${td}${clm}export qbt_qt_version=\"\"${cend} ${td}----------------${cend} ${td}${clr}options${cend} ${td}5 - 5.15 - 6 - 6.2 - 6.3 and so on${cend}"
+			echo -e " ${td}${clm}export qbt_build_tool=\"\"${cend} ${td}----------------${cend} ${td}${clr}options${cend} ${td}qmake - cmake${cend}"
+			echo -e " ${td}${clm}export qbt_cross_name=\"\"${cend} ${td}----------------${cend} ${td}${clr}options${cend} ${td}x86_64 - aarch64 - armv7 - armhf${cend}"
+			echo -e " ${td}${clm}export qbt_patches_url=\"\"${cend} ${td}---------------${cend} ${td}${clr}options${cend} ${td}userdocs/qbittorrent-nox-static.${cend}"
+			echo -e " ${td}${clm}export qbt_workflow_files=\"\"${cend} ${td}------------${cend} ${td}${clr}options${cend} ${td}yes no - use qbt-workflow-files for dependencies${cend}"
+			echo -e " ${td}${clm}export qbt_libtorrent_master_jamfile=\"\"${cend} ${td}-${cend} ${td}${clr}options${cend} ${td}yes no - use RC branch instead of release jamfile${cend}"
+			echo -e " ${td}${clm}export qbt_optimise_strip=\"\"${cend} ${td}------------${cend} ${td}${clr}options${cend} ${td}yes no - strip binaries - cannot be used with debug${cend}"
+			echo -e " ${td}${clm}export qbt_build_debug=\"\"${cend} ${td}---------------${cend} ${td}${clr}options${cend} ${td}yes no - debug build - cannot be used with strip${cend}"
 			echo
 			echo -e " ${tb}${tu}Currrent settings${cend}"
 			echo
@@ -1474,6 +1521,9 @@ while (("${#}")); do
 			echo -e " ${cly}qbt_patches_url=\"${clg}${qbt_patches_url}${cly}\"${cend}"
 			echo -e " ${cly}qbt_workflow_files=\"${clg}${qbt_workflow_files}${cly}\"${cend}"
 			echo -e " ${cly}qbt_libtorrent_master_jamfile=\"${clg}${qbt_libtorrent_master_jamfile}${cly}\"${cend}"
+			echo -e " ${cly}qbt_optimise_strip=\"${clg}${qbt_optimise_strip}${cly}\"${cend}"
+			echo -e " ${cly}qbt_build_debug=\"${clg}${qbt_build_debug}${cly}\"${cend}${tn}"
+			exit
 			echo
 			exit
 			;;
@@ -1594,7 +1644,7 @@ while (("${#}")); do
 			echo
 			echo -e " ${ulcc} ${tb}${tu}Here is the help description for this flag:${cend}"
 			echo
-			echo -e " Enables debug symbols for libtorrent and qbitorrent when building"
+			echo -e " Enables debug symbols for libtorrent and qbitorrent when building - required for gdb backtrace"
 			echo
 			exit
 			;;
@@ -1751,7 +1801,9 @@ while (("${#}")); do
 			echo
 			echo -e " Strip the qbittorrent-nox binary of unneeded symbols to decrease file size"
 			echo
-			echo -e " ${uyc} This will reduce the size of the file by about 15MB but break the built in stacktrace features of qbittorrent"
+			echo -e " ${uyc} Static musl builds don't work with qBittorrents built in stacktrace."
+			echo
+			echo -e " If you need to debug a build with gdb you must build a debug build using the flag ${clb}-d${cend}"
 			echo
 			echo -e " ${td}This flag is provided with no arguments.${cend}"
 			echo
@@ -1883,7 +1935,7 @@ if [[ "${!app_name_skip:-yes}" == 'no' || "${1}" == "${app_name}" ]]; then
 		[[ "${qbt_cross_target}" =~ ^(alpine)$ ]] && echo -e "\narchfound ${qbt_zlib_arch:-x86_64}" >> "${qbt_install_dir}/zlib/cmake/detect-arch.c"
 
 		cmake -Wno-dev -Wno-deprecated --graphviz="${qbt_install_dir}/graphs/${zlib_version}/dep-graph.dot" -G Ninja -B build \
-			-D CMAKE_VERBOSE_MAKEFILE="${qbt_cmake_debug:-OFF}" \
+			-D CMAKE_VERBOSE_MAKEFILE="${qbt_cmake_debug}" \
 			-D CMAKE_CXX_STANDARD="${standard}" \
 			-D CMAKE_PREFIX_PATH="${qbt_install_dir}" \
 			-D BUILD_SHARED_LIBS=OFF \
@@ -2050,7 +2102,7 @@ if [[ "${!app_name_skip:-yes}" == 'no' ]] || [[ "${1}" == "${app_name}" ]]; then
 			mkdir -p "${qbt_install_dir}/graphs/${libtorrent_github_tag}"
 			cmake -Wno-dev -Wno-deprecated --graphviz="${qbt_install_dir}/graphs/${libtorrent_github_tag}/dep-graph.dot" -G Ninja -B build \
 				"${multi_libtorrent[@]}" \
-				-D CMAKE_VERBOSE_MAKEFILE="${qbt_cmake_debug:-OFF}" \
+				-D CMAKE_VERBOSE_MAKEFILE="${qbt_cmake_debug}" \
 				-D CMAKE_BUILD_TYPE="Release" \
 				-D CMAKE_CXX_STANDARD="${standard}" \
 				-D CMAKE_PREFIX_PATH="${qbt_install_dir};${qbt_install_dir}/boost" \
@@ -2088,7 +2140,7 @@ if [[ "${!app_name_skip:-yes}" == 'no' ]] || [[ "${1}" == "${app_name}" ]]; then
 				lt_cmake_flags="-DTORRENT_USE_LIBCRYPTO -DTORRENT_USE_OPENSSL -DTORRENT_USE_I2P=1 -DBOOST_ALL_NO_LIB -DBOOST_ASIO_ENABLE_CANCELIO -DBOOST_ASIO_HAS_STD_CHRONO -DBOOST_MULTI_INDEX_DISABLE_SERIALIZATION -DBOOST_SYSTEM_NO_DEPRECATED -DBOOST_SYSTEM_STATIC_LINK=1 -DTORRENT_USE_ICONV=1"
 			fi
 			#
-			"${qbt_install_dir}/boost/b2" "${multi_libtorrent[@]}" -j"$(nproc)" "${lt_version_options[@]}" address-model="$(getconf LONG_BIT)" "${lt_debug}" optimization=speed cxxstd="${standard}" dht=on encryption=on crypto=openssl i2p=on extensions=on variant=release threading=multi link=static boost-link=static cxxflags="${CXXFLAGS}" cflags="${CPPFLAGS}" linkflags="${LDFLAGS}" install --prefix="${qbt_install_dir}" |& tee "${qbt_install_dir}/logs/${app_name}.log"
+			"${qbt_install_dir}/boost/b2" "${multi_libtorrent[@]}" -j"$(nproc)" "${lt_version_options[@]}" address-model="$(getconf LONG_BIT)" "${qbt_libtorrent_debug}" optimization=speed cxxstd="${standard}" dht=on encryption=on crypto=openssl i2p=on extensions=on variant=release threading=multi link=static boost-link=static cxxflags="${CXXFLAGS}" cflags="${CPPFLAGS}" linkflags="${LDFLAGS}" install --prefix="${qbt_install_dir}" |& tee "${qbt_install_dir}/logs/${app_name}.log"
 			#
 			post_command build
 			#
@@ -2133,7 +2185,7 @@ if [[ "${!app_name_skip:-yes}" == 'no' || "${1}" == "${app_name}" ]]; then
 	if [[ "${qbt_build_tool}" == 'cmake' && "${qbt_qt_version}" =~ ^6 ]]; then
 		cmake -Wno-dev -Wno-deprecated --graphviz="${qbt_install_dir}/graphs/${double_conversion_version}/dep-graph.dot" -G Ninja -B build \
 			"${multi_libtorrent[@]}" \
-			-D CMAKE_VERBOSE_MAKEFILE="${qbt_cmake_debug:-OFF}" \
+			-D CMAKE_VERBOSE_MAKEFILE="${qbt_cmake_debug}" \
 			-D CMAKE_PREFIX_PATH="${qbt_install_dir}" \
 			-D CMAKE_CXX_FLAGS="${CXXFLAGS}" \
 			-D CMAKE_INSTALL_LIBDIR=lib \
@@ -2173,7 +2225,7 @@ if [[ "${!app_name_skip:-yes}" == 'no' ]] || [[ "${1}" == "${app_name}" ]]; then
 		mkdir -p "${qbt_install_dir}/graphs/${libtorrent_github_tag}"
 		cmake -Wno-dev -Wno-deprecated --graphviz="${qbt_install_dir}/graphs/${qt6_version}/dep-graph.dot" -G Ninja -B build \
 			"${multi_libtorrent[@]}" \
-			-D CMAKE_VERBOSE_MAKEFILE="${qbt_cmake_debug:-OFF}" \
+			-D CMAKE_VERBOSE_MAKEFILE="${qbt_cmake_debug}" \
 			-D CMAKE_BUILD_TYPE="release" \
 			-D QT_FEATURE_optimize_full=on -D QT_FEATURE_static=on -D QT_FEATURE_shared=off \
 			-D QT_FEATURE_gui=off -D QT_FEATURE_openssl_linked=on \
@@ -2203,7 +2255,7 @@ if [[ "${!app_name_skip:-yes}" == 'no' ]] || [[ "${1}" == "${app_name}" ]]; then
 		sed '/^#  include <utility>/a #  include <limits>' -i "src/corelib/global/qglobal.h"
 
 		# Don't strip by default by disabling these options. We will set it as off by default and use it with a switch
-		echo "CONFIG                 += ${qbt_strip_qmake:-nostrip}" >> "mkspecs/common/linux.conf"
+		echo "CONFIG                 += ${qbt_strip_qmake}" >> "mkspecs/common/linux.conf"
 
 		./configure "${multi_qtbase[@]}" -prefix "${qbt_install_dir}" "${icu[@]}" -opensource -confirm-license -release \
 			-openssl-linked -static -c++std "${cxx_standard}" -qt-pcre \
@@ -2241,7 +2293,7 @@ if [[ "${!app_name_skip:-yes}" == 'no' ]] || [[ "${1}" == "${app_name}" ]]; then
 		mkdir -p "${qbt_install_dir}/graphs/${libtorrent_github_tag}"
 		cmake -Wno-dev -Wno-deprecated --graphviz="${qbt_install_dir}/graphs/${qt6_version}/dep-graph.dot" -G Ninja -B build \
 			"${multi_libtorrent[@]}" \
-			-D CMAKE_VERBOSE_MAKEFILE="${qbt_cmake_debug:-OFF}" \
+			-D CMAKE_VERBOSE_MAKEFILE="${qbt_cmake_debug}" \
 			-D CMAKE_BUILD_TYPE="release" \
 			-D CMAKE_CXX_STANDARD="${standard}" \
 			-D CMAKE_PREFIX_PATH="${qbt_install_dir}" \
@@ -2302,7 +2354,7 @@ if [[ "${!app_name_skip:-yes}" == 'no' ]] || [[ "${1}" == "${app_name}" ]]; then
 			mkdir -p "${qbt_install_dir}/graphs/${qbittorrent_github_tag}"
 			cmake -Wno-dev -Wno-deprecated --graphviz="${qbt_install_dir}/graphs/${qbittorrent_github_tag}/dep-graph.dot" -G Ninja -B build \
 				"${multi_qbittorrent[@]}" \
-				-D CMAKE_VERBOSE_MAKEFILE="${qbt_cmake_debug:-OFF}" \
+				-D CMAKE_VERBOSE_MAKEFILE="${qbt_cmake_debug}" \
 				-D CMAKE_BUILD_TYPE="release" \
 				-D QT6="${qbt_use_qt6}" \
 				-D STACKTRACE="${stacktrace:-ON}" \
@@ -2326,7 +2378,7 @@ if [[ "${!app_name_skip:-yes}" == 'no' ]] || [[ "${1}" == "${app_name}" ]]; then
 				QT_QMAKE="${qbt_install_dir}/bin" \
 				--prefix="${qbt_install_dir}" \
 				"${multi_qbittorrent[@]}" \
-				"${qbt_debug}" \
+				"${qbt_qbittorrent_debug}" \
 				--disable-gui \
 				CXXFLAGS="${CXXFLAGS}" CPPFLAGS="${CPPFLAGS}" LDFLAGS="${LDFLAGS}" \
 				--with-boost="${qbt_install_dir}/boost" --with-boost-libdir="${lib_dir}" |& tee -a "${qbt_install_dir}/logs/${app_name}.log"
